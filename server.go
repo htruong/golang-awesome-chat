@@ -9,12 +9,41 @@
 package main
 
 import (
+	"./uuid"
+	"code.google.com/p/monnand-goconf"
+	"encoding/json"
+	"flag"
 	"fmt"
-	"html/template"
+	//"html/template"
 	"log"
 	"net/http"
+	//"net/url"
+	"crypto/md5"
+	"io"
+	"strings"
 	"time"
 )
+
+type EventMessage struct {
+	Service   bool
+	Timestamp int64
+	Code      string
+	Origin    string
+	dest      string
+	Payload   string
+}
+
+type Session struct {
+	id     string
+	Nick   string
+	Muted  bool
+	Admin  bool
+	Joined int64
+}
+
+type UserListMessage struct {
+	Sessions []Session
+}
 
 // A single Broker will be created in this program. It is responsible
 // for keeping a list of which clients (browsers) are currently attached
@@ -23,23 +52,24 @@ import (
 type Broker struct {
 
 	// Create a map of clients, the keys of the map are the channels
-	// over which we can push messages to attached clients.  (The values
-	// are just booleans and are meaningless.)
-	//
-	clients map[chan string]bool
+	// over which we can push messages to attached clients.
+	clients map[chan string]*Session
 
-	// Channel into which new clients can be pushed
-	//
-	newClients chan chan string
+	// Config file
+	cfg *conf.ConfigFile
 
-	// Channel into which disconnected clients should be pushed
-	//
-	defunctClients chan chan string
+	// Banned users
+	bannedUsers *map[string]bool
+
+	// Admin users
+	adminUsers *map[string]bool
 
 	// Channel into which messages are pushed to be broadcast out
 	// to attahed clients.
-	//
-	messages chan string
+	messages chan EventMessage
+
+	// Cached messages
+	cachedmessages []string
 }
 
 // This Broker method starts a new goroutine.  It handles
@@ -47,43 +77,38 @@ type Broker struct {
 // of messages out to clients that are currently attached.
 //
 func (b *Broker) Start() {
-
-	// Start a goroutine
-	//
 	go func() {
 
 		// Loop endlessly
 		//
 		for {
+			log.Printf("Waiting for the next global message...\n")
+			//case msg := <-b.messages:
+			msg := <-b.messages
+			msgToSend, err := json.Marshal((msg))
 
-			// Block until we receive from one of the
-			// three following channels.
-			select {
+			log.Printf("Got: %s. Delivering...\n", msgToSend)
+			// There is a new message to send.  For each
+			// attached client, push the new message
+			// into the client's message channel.
+			if err == nil {
+				sMsgToSend := string(msgToSend)
 
-			case s := <-b.newClients:
-
-				// There is a new client attached and we
-				// want to start sending them messages.
-				b.clients[s] = true
-				log.Println("Added new client")
-
-			case s := <-b.defunctClients:
-
-				// A client has dettached and we want to
-				// stop sending them messages.
-				delete(b.clients, s)
-				log.Println("Removed client")
-
-			case msg := <-b.messages:
-
-				// There is a new message to send.  For each
-				// attached client, push the new message
-				// into the client's message channel.
-				for s, _ := range b.clients {
-					s <- msg
+				if len(msg.dest) == 0 && msg.Code == "msg" {
+					if len(b.cachedmessages) > 99 {
+						b.cachedmessages = b.cachedmessages[1 : len(b.cachedmessages)-1]
+					}
+					b.cachedmessages = append(b.cachedmessages, sMsgToSend)
 				}
-				log.Printf("Broadcast message to %d clients", len(b.clients))
+
+				for s, session := range b.clients {
+					if (len(msg.dest) == 0) || (session.id == msg.dest) {
+						s <- sMsgToSend
+					}
+				}
+				//log.Printf("Broadcast message to %d clients", len(b.clients))
 			}
+			//}
 		}
 	}()
 }
@@ -100,127 +125,341 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cb := w.(http.CloseNotifier).CloseNotify()
+
 	// Create a new channel, over which the broker can
 	// send this client messages.
 	messageChan := make(chan string)
 
 	// Add this client to the map of those that should
 	// receive updates
-	b.newClients <- messageChan
+	newUUID, _ := uuid.GenUUID()
+	b.clients[messageChan] = &Session{
+		id:     newUUID,
+		Muted:  true,
+		Admin:  false,
+		Nick:   "",
+		Joined: time.Now().Unix()}
+	log.Printf("Added new client %s", newUUID)
+
+	// Send UUID back to client
+	go func() {
+		msg, _ := json.Marshal(EventMessage{
+			Service:   true,
+			Timestamp: time.Now().Unix(),
+			Code:      "uuid-return",
+			Origin:    "auth",
+			dest:      newUUID,
+			Payload:   newUUID})
+		messageChan <- string(msg)
+		log.Printf("Sent new client its uuid %s", newUUID)
+		log.Printf(">>>> %d", len(b.cachedmessages))
+		for _, val := range b.cachedmessages {
+			messageChan <- val
+		}
+	}()
 
 	// Remove this client from the map of attached clients
 	// when `EventHandler` exits.
-	defer func() {
-		b.defunctClients <- messageChan
+	go func() {
+		<-cb
+		nick := b.clients[messageChan].Nick
+		delete(b.clients, messageChan)
+		log.Printf("Removed client %s", newUUID)
+		if len(nick) > 0 {
+			b.messages <- EventMessage{
+				Service:   true,
+				Timestamp: time.Now().Unix(),
+				Code:      "part",
+				Origin:    "sys",
+				dest:      "",
+				Payload:   nick}
+		}
 	}()
+
+	log.Printf("Caught client callback %s", newUUID)
 
 	// Set the headers related to event streaming.
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	// Don't close the connection, instead loop 10 times,
+	// Don't close the connection,
 	// sending messages and flushing the response each time
 	// there is a new message to send along.
-	//
-	// NOTE: we could loop endlessly; however, then you 
-	// could not easily detect clients that dettach and the
-	// server would continue to send them messages long after
-	// they're gone due to the "keep-alive" header.  One of
-	// the nifty aspects of SSE is that clients automatically
-	// reconnect when they lose their connection.
-	//
-	// A better way to do this is to use the CloseNotifier
-	// interface that will appear in future releases of 
-	// Go (this is written as of 1.0.3):
-	// https://code.google.com/p/go/source/detail?name=3292433291b2
-	//
-	for i := 0; i < 10; i++ {
-
-		// Read from our messageChan.
+	done := false
+	for !done {
+		log.Printf("Waiting for the next channel message...\n")
 		msg := <-messageChan
-
-		// Write to the ResponseWriter, `w`.
-		fmt.Fprintf(w, "data: Message: %s\n\n", msg)
-
-		// Flush the response.  This is only possible if
-		// the repsonse supports streaming.
-		f.Flush()
+		log.Printf("Got: %s. Sending...\n", msg)
+		_, err := fmt.Fprintf(w, "data: %s\n\n", msg)
+		if err != nil {
+			done = true
+		} else {
+			f.Flush()
+		}
 	}
-
-	// Done.
-	log.Println("Finished HTTP request at ", r.URL.Path)
 }
 
-// Handler for the main page, which we wire up to the 
-// route at "/" below in `main`.
-//
-func MainPageHandler(w http.ResponseWriter, r *http.Request) {
+func AuthHandler(w http.ResponseWriter, r *http.Request, b *Broker) {
+	v := r.URL.Query()
+	nick := v.Get("nick")
+	auth := v.Get("auth")
+	uuid := v.Get("uuid")
+	secret, err := b.cfg.GetString("server", "secret")
+	if err != nil {
+		secret = ""
+	}
+	dryrun, err := b.cfg.GetBool("server", "dryrun")
+	if err != nil {
+		dryrun = false
+	}
+	h := md5.New()
+	io.WriteString(h, nick)
+	io.WriteString(h, secret)
+	success := 0
+	if auth == string(h.Sum(nil)) || dryrun {
+		success = 1
 
-	// Did you know Golang's ServeMux matches only the
-	// prefix of the request URL?  It's true.  Here we 
-	// insist the path is just "/".
-	if r.URL.Path != "/" {
-		w.WriteHeader(http.StatusNotFound)
+		// announce join
+		b.messages <- EventMessage{
+			Service:   true,
+			Timestamp: time.Now().Unix(),
+			Code:      "join",
+			Origin:    "sys",
+			dest:      "",
+			Payload:   nick}
+	}
+
+	session := findSession(b, uuid)
+	session.Nick = nick
+	isBanned := (*b.bannedUsers)[nick]
+	isAdmin := (*b.adminUsers)[nick]
+	if !isBanned {
+		session.Muted = false
+	}
+
+	if isAdmin || dryrun {
+		session.Admin = true
+	}
+
+	msg := EventMessage{
+		Service:   false,
+		Timestamp: time.Now().Unix(),
+		Code:      "msg-receipt",
+		Origin:    "sys",
+		dest:      uuid,
+		Payload:   string(success)}
+
+	msgToSend, _ := json.Marshal((msg))
+
+	w.Header().Set("Content-Type", "text/javascript")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Write(msgToSend)
+	//fmt.Fprintf(w, "%s", msgToSend)
+}
+
+func findSession(b *Broker, uuid string) *Session {
+	for _, session := range b.clients {
+		if session.id == uuid {
+			return session
+		}
+	}
+	return nil
+}
+
+func findSessionByNickname(b *Broker, nick string) *Session {
+	for _, session := range b.clients {
+		if session.Nick == nick {
+			return session
+		}
+	}
+	return nil
+}
+
+func SendHandler(w http.ResponseWriter, r *http.Request, b *Broker) {
+	v := r.URL.Query()
+	payload := v.Get("payload")
+	uuid := v.Get("uuid")
+
+	ret := "false"
+	session := findSession(b, uuid)
+
+	if session != nil && !session.Muted {
+		b.messages <- EventMessage{
+			Service:   false,
+			Timestamp: time.Now().Unix(),
+			Code:      "msg",
+			Origin:    session.Nick,
+			dest:      "",
+			Payload:   payload}
+		ret = "true"
+	}
+
+	msg := EventMessage{
+		Service:   true,
+		Timestamp: time.Now().Unix(),
+		Code:      "msg-receipt",
+		Origin:    "sys",
+		dest:      uuid,
+		Payload:   ret}
+
+	w.Header().Set("Content-Type", "text/javascript")
+	w.Header().Set("Cache-Control", "no-cache")
+	msgToSend, _ := json.Marshal((msg))
+
+	w.Write(msgToSend)
+	//fmt.Fprintf(w, "%s", string(msgToSend))
+}
+
+func CommandHandler(w http.ResponseWriter, r *http.Request, b *Broker) {
+	v := r.URL.Query()
+	payload := v.Get("payload")
+	uuid := v.Get("uuid")
+
+	ret := "false"
+
+	session := findSession(b, uuid)
+
+	if !session.Admin {
 		return
 	}
 
-	// Read in the template with our SSE JavaScript code.
-	t, err := template.ParseFiles("templates/index.html")
-	if err != nil {
-		log.Fatal("WTF dude, error parsing your template.")
-
+	// Okay let's do it
+	cmd := strings.SplitN(payload, " ", 2)
+	ret = "true"
+	switch cmd[0] {
+	case "ban":
+		(*b.bannedUsers)[cmd[1]] = true
+		sess := findSessionByNickname(b, cmd[1])
+		sess.Muted = true
+	case "unban":
+		delete(*b.bannedUsers, cmd[1])
+		sess := findSessionByNickname(b, cmd[1])
+		sess.Muted = false
+	case "op":
+		(*b.adminUsers)[cmd[1]] = true
+		sess := findSessionByNickname(b, cmd[1])
+		sess.Admin = true
+	case "unop":
+		delete(*b.adminUsers, cmd[1])
+		sess := findSessionByNickname(b, cmd[1])
+		sess.Admin = false
+	default:
+		ret = "false"
 	}
 
-	// Render the template, writing to `w`.
-	t.Execute(w, "Duder")
+	defer func() {
+		msg := EventMessage{
+			Service:   true,
+			Timestamp: time.Now().Unix(),
+			Code:      "cmd-receipt",
+			Origin:    "sys",
+			dest:      uuid,
+			Payload:   ret}
 
-	// Done.
-	log.Println("Finished HTTP request at ", r.URL.Path)
+		w.Header().Set("Content-Type", "text/javascript")
+		w.Header().Set("Cache-Control", "no-cache")
+		msgToSend, _ := json.Marshal((msg))
+
+		w.Write(msgToSend)
+	}()
+
+}
+
+func UsersListHandler(w http.ResponseWriter, r *http.Request, b *Broker) {
+
+	sessions := make([]Session, 0, 100)
+	for _, session := range b.clients {
+		if len(session.Nick) > 0 {
+			sessions = append(sessions, *session)
+		}
+	}
+
+	msg := UserListMessage{
+		Sessions: sessions,
+	}
+
+	w.Header().Set("Content-Type", "text/javascript")
+	w.Header().Set("Cache-Control", "no-cache")
+	msgToSend, _ := json.Marshal((msg))
+
+	w.Write(msgToSend)
 }
 
 // Main routine
 //
 func main() {
+	var configFile *string = flag.String("f", "lily.conf", "Config file")
+	var port *string = flag.String("p", "8080", "Server Port")
+	var verbose *bool = flag.Bool("v", false, "Verbose")
+
+	flag.Parse()
+
+	if *verbose {
+		// Do some studpid shit
+	}
+
+	cfg, _ := conf.ReadConfigFile(*configFile)
+	admins, _ := cfg.GetString("room", "admins")
+
+	adminUsers := make(map[string]bool)
+	rootAdmins := strings.Split(admins, ";")
+	for _, i := range rootAdmins {
+		adminUsers[i] = true
+	}
+
+	bannedUsers := make(map[string]bool)
+
+	cachedmessages := make([]string, 0, 100)
 
 	// Make a new Broker instance
 	b := &Broker{
-		make(map[chan string]bool),
-		make(chan (chan string)),
-		make(chan (chan string)),
-		make(chan string),
+		clients:        make(map[chan string]*Session),
+		cfg:            cfg,
+		bannedUsers:    &bannedUsers,
+		adminUsers:     &adminUsers,
+		messages:       make(chan EventMessage),
+		cachedmessages: cachedmessages,
 	}
 
 	// Start processing events
 	b.Start()
 
-	// Make b the HTTP handler for "/events/".  It can do 
+	// Make b the HTTP handler for "/events/".  It can do
 	// this because it has a ServeHTTP method.  That method
-	// is called in a separate goroutine for each 
+	// is called in a separate goroutine for each
 	// request to "/events/".
-	http.Handle("/events/", b)
+	http.Handle("/chat/events/", b)
 
-	// Generate a constant stream of events that get pushed
-	// into the Broker's messages channel and are then broadcast
-	// out to any clients that are attached.
-	go func() {
-		for i := 0; ; i++ {
+	http.Handle(
+		"/chat/auth/",
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			AuthHandler(w, r, b)
+		}))
 
-			// Create a little message to send to clients,
-			// including the current time.
-			b.messages <- fmt.Sprintf("%d - the time is %v", i, time.Now())
+	http.Handle(
+		"/chat/send/",
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			SendHandler(w, r, b)
+		}))
 
-			// Print a nice log message and sleep for 5s.
-			log.Printf("Sent message %d ", i)
-			time.Sleep(5 * 1e9)
+	http.Handle(
+		"/chat/command/",
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			CommandHandler(w, r, b)
+		}))
 
-		}
-	}()
+	http.Handle(
+		"/chat/userslist/",
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			UsersListHandler(w, r, b)
+		}))
 
 	// When we get a request at "/", call `MainPageHandler`
 	// in a new goroutine.
-	http.Handle("/", http.HandlerFunc(MainPageHandler))
+	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
 
 	// Start the server and listen forever on port 8000.
-	http.ListenAndServe(":8000", nil)
+	http.ListenAndServe(":"+*port, nil)
 }

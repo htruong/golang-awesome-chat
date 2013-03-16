@@ -1,0 +1,6 @@
+[server]
+dryrun = 1
+secret = wasabibibibi
+
+[room]
+admins = wasabi
