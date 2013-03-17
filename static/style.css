@@ -145,10 +145,10 @@ a:hover { text-decoration: underline; color: #aaa; }
 /* not very important info */
 .notice, .message .date { color: #eee; }
 .error { background-color: #200; }
-.personal, .notice { background-color: #161616; }
+.personal, .notice { background-color: #333; border-bottom: 1px dashed red; }
 
 .message {
-  margin: 0 1em;
+  padding: 0.2em 1em;
 }
 
 .nick {
@@ -157,13 +157,15 @@ a:hover { text-decoration: underline; color: #aaa; }
 
 .msg-info {
     padding: 0.6em 0 0.1em 0;
+	min-width: 75px;
+	display: inline-block;
 }
 
-.msg-info .date {
+.msg-info .hidden {
     visibility: hidden;
 }
 
-.msg-info:hover .date {
+.msg-info:hover .hidden {
     visibility: visible;
 }
 
@@ -178,8 +180,7 @@ input {
 }
 
 .msg-text {
-    display: block;
-    padding-left: 0.5em;
+    /*padding-left: 0.5em;*/
 }
 
 

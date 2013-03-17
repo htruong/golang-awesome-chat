@@ -1,19 +1,10 @@
-var CONFIG = { debug: false
-, nick: "#"   // set in onConnect
-, id: null    // set in onConnect
-, last_message_time: 0
-, focus: true //event listeners bound in onConnect
-, unread: 0 //updated in the message-processing loop
-};
+///////////////////////////////////////////////////////////////////////
 
 var uuid = "";
 var authNick = "";
 var authHash = "";
 
-///////////////////////////////////////////////////////////////////////
-
-var nicks = [];
-var isNickListDirty = true;
+var userscount = 0;
 
 var originalTitle = "";
 
@@ -301,8 +292,8 @@ var assignr = new colorAssigner();
 
 //updates the users link to reflect the number of active users
 function updateUsersLink ( ) {
-	var t = nicks.length.toString() + " user";
-	if (nicks.length != 1) t += "s";
+	var t = userscount + " user";
+	if (userscount > 1) t += "s";
 	$("#usersLink").text(t);
 }
 
@@ -311,14 +302,16 @@ function userJoin(nick, timestamp) {
 	//put it in the stream
 	//addMessage(nick, "joined", timestamp, "join");
 	$("#last").text(nick + " <<");
-	isNickListDirty = true;
+	userscount ++;
+	updateUsersLink();
 }
 
 //handles someone leaving
 function userPart(nick, timestamp) {
 	//put it in the stream
 	$("#last").text(nick + " >>");
-	isNickListDirty = true;
+	userscount --;
+	updateUsersLink();
 }
 
 // utility functions
@@ -378,13 +371,20 @@ function updateUptime () {
 //inserts an event into the stream for display
 //the event may be a msg, join or part type
 //from is the user, text is the body and time is the timestamp, defaulting to now
-//_class is a css class to apply to the message, usefull for system events
+//cssclass is a css class to apply to the message, usefull for system events
 
 lastSender = "";
+lastMsgDiv = null;
 //var seq = 0;
-function addMessage (from, text, time, _class) {
+function addMessage (from, text, time, cssclass) {
 	if (text === null)
 		return;
+	
+	if (lastSender == from) {
+		lastMsgDiv.html(lastMsgDiv.html() + ' &bull; <span class="msg-text">' + text  + '</span>')
+		scrollDown();
+		return;
+	}
 	
 	if (time == null) {
 		// if the time is null or undefined, use the current time.
@@ -401,33 +401,36 @@ function addMessage (from, text, time, _class) {
 	var messageElement = $(document.createElement("div"));
 	
 	messageElement.addClass("message");
-	if (_class)
-		messageElement.addClass(_class);
+	
+	if (cssclass) {
+		messageElement.addClass(cssclass);
+	}
 	
 	// If the current user said this, add a special css class
-	var nick_re = new RegExp(CONFIG.nick);
-	if (nick_re.exec(text) || from == "sys")
+	var nick_re = new RegExp(authNick);
+	if (nick_re.exec(text))
 		messageElement.addClass("personal");
 	
 	// replace URLs with links
 	text = text.replace(util.urlRE, '"$&":$&');
 	//seq++;
 	//from = '' + seq + '. ' + from;
-	text = formattr.format(text);
+	if (from != "sys") {
+		text = formattr.format(text);
+	}
 	
 	color = assignr.getColor(from );
 	
-	var content = ''
-	+ ((lastSender != from) ?
-	'  <div class="msg-info" style="color: ' + color + '"><span class="nick">' + util.toStaticHTML(from) + '</span>' +
-	'  <span class="date">' + util.timeString(time) + '</span></div>' 
-	: '')
-	+ '  <span class="msg-text" style="color: ' + color + '">' + text  + '</span>'
-	+ ''
+	var content = '' +
+	'  <span class="msg-info" style="color: ' + color + '"><span class="nick"><a title="' + util.timeString(time) + '" href="javascript:fill_in(\'@' + from + ' \')">' + util.toStaticHTML(from) + '</a></span>' +
+	'<span class="hidden"> [<a title="' + util.timeString(time) + '" href="javascript:fill_in(\'/_ban ' + from + '\')">!</a>]</span>' +
+	'</span>' +
+	'  <span class="msg-text">' + text  + '</span>'
 	;
 	
 	lastSender = from;
 	messageElement.html(content);
+	lastMsgDiv = messageElement;
 	
 	//the log is the stream that we view
 	$("#log").append(messageElement);
@@ -449,7 +452,16 @@ function processEvent(evt) {
 				, url: "/chat/auth/"
 				, dataType: "json"
 				, data: { nick: authNick, uuid: uuid, auth: authHash }
+				, success: function(data) {
+					if (data.Payload != "true") {
+						alert("You have not successfully authenticated. " +
+						"Either your authentication string is bad or you have been banned.");
+					} else {
+						send("/_getoldmessages 100");
+					}
+				}
 			});
+			outputUsers();
 			break;
 			
 		case "join":
@@ -467,81 +479,8 @@ function processEvent(evt) {
 	}
 }
 
-function longPoll (data) {
-	if (transmission_errors > 2) {
-		showConnect();
-		return;
-	}
-	
-	//process any updates we may have
-	//data will be null on the first call of longPoll
-	if (data && data.messages) {
-		for (var i = 0; i < data.messages.length; i++) {
-			var message = data.messages[i];
-			
-			//track oldest message so we only request newer messages from server
-			if (message.timestamp > CONFIG.last_message_time)
-				CONFIG.last_message_time = message.timestamp;
-			
-			//dispatch new messages to their appropriate handlers
-			switch (message.type) {
-				case "msg":
-					if(!CONFIG.focus){
-						CONFIG.unread++;
-					}
-					addMessage(message.nick, message.text, message.timestamp);
-					break;
-					
-				case "announcement":
-					addMessage("**system announcement**", message.text, message.timestamp);
-					break;
-					
-				case "join":
-					userJoin(message.nick, message.timestamp);
-					break;
-					
-				case "part":
-					userPart(message.nick, message.timestamp);
-					break;
-			}
-		}
-		//update the document title to include unread message count if blurred
-		updateTitle();
-		
-		//only after the first request for messages do we want to show who is here
-		if (first_poll) {
-			first_poll = false;
-			who();
-		}
-	}
-	
-	//make another request
-	$.ajax({ cache: false
-	, type: "GET"
-	, url: "/recv"
-	, dataType: "json"
-	, data: { since: CONFIG.last_message_time, id: CONFIG.id }
-	, error: function () {
-		addMessage("", "*** Long poll error. trying again...", new Date(), "error");
-	transmission_errors += 1;
-	//don't flood the servers on error, wait 10 seconds before retrying
-	setTimeout(longPoll, 10*1000);
-	}
-	, success: function (data) {
-		transmission_errors = 0;
-		//if everything went well, begin another request immediately
-		//the server will take a long time to respond
-		//how long? well, it will wait until there is another message
-		//and then it will return it to us and close the connection.
-		//since the connection is closed when we get data, we longPoll again
-		longPoll(data);
-	}
-	});
-}
-
 //submit a new message to the server
 function send(msg) {
-	if (CONFIG.debug === false) {
 		if (msg[0] != "/") {
 			jQuery.get("/chat/send/", {uuid: uuid, payload: msg}, function (data) {
 					console.log(data);
@@ -552,13 +491,14 @@ function send(msg) {
 			jQuery.get("/chat/command/", {uuid: uuid, payload: payload}, function (data) {
 					console.log(data);
 					if (data.Payload == "true") {
-						addMessage(data.Origin, "Your command is completed successfully", data.Timestamp);
+						addMessage(data.Origin, "Your command has been executed successfully", data.Timestamp);
+					} else if (data.Payload == "") {
+						//addMessage(data.Origin, "Your command has been executed successfully", data.Timestamp);
 					} else {
-						addMessage(data.Origin, "Bad command or file name", data.Timestamp);
+						addMessage(data.Origin, "Your command returns: " + data.Payload, data.Timestamp);
 					}
 			}, "json");
 		}
-	}
 }
 
 function getQueryVariable(variable) {
@@ -642,15 +582,24 @@ function outputUsers () {
 				, dataType: "json"
 				, data: { uuid: uuid }
 				, success: function (data) {
+					userscount = data.Sessions.length;
 					console.log(data);
 					nick_string = "";
 					for (i = 0; i < data.Sessions.length; ++i) {
-						nick_string += data.Sessions[i].Nick + " (Joined: " + new Date(data.Sessions[i].Joined * 1000).toRelativeTime() + " ago) | ";
+						if (data.Sessions[i].Nick != authNick) {
+							nick_string += "<a href='javascript:fill_in(\"@" + data.Sessions[i].Nick + " \")' title='Connected: " + new Date(data.Sessions[i].Joined * 1000).toRelativeTime() + " ago'>@" + data.Sessions[i].Nick + "</a> (<a href='javascript:fill_in(\"/_ban #" + data.Sessions[i].UID + "\")'>Vote ban</a>) | ";
+						}
 					}
-					addMessage("users:", nick_string, new Date(), "notice");
+					addMessage("sys", "Users here now: " + nick_string, new Date(), null);
+					updateUsersLink();
 				}
 			});
 	return false;
+}
+
+function fill_in(what) {
+	$("#entry").attr("value", what);
+	$("#entry").focus();
 }
 
 $(document).ready(function() {
@@ -672,6 +621,7 @@ $(document).ready(function() {
 	
 	var source = new EventSource('/chat/events/');
 	
+	
 	// Create a callback for when a new message is received.
 	source.onmessage = function(e) {
 		// Append the `data` attribute of the message to the DOM.
@@ -679,11 +629,6 @@ $(document).ready(function() {
 		console.log(evt);
 		processEvent (evt);
 	};
-	
-	if (CONFIG.debug) {
-		scrollDown();
-		return;
-	}
 	
 	
 	originalTitle = document.title;
