@@ -218,7 +218,9 @@ func AuthHandler(w http.ResponseWriter, r *http.Request, b *Broker) {
 	io.WriteString(h, nick)
 	io.WriteString(h, secret)
 	success := 0
-	if auth == string(h.Sum(nil)) || dryrun {
+	t := h.Sum(nil)
+	expected := fmt.Sprintf("%x", t)
+	if auth == expected || dryrun {
 		success = 1
 
 		// announce join
@@ -242,6 +244,8 @@ func AuthHandler(w http.ResponseWriter, r *http.Request, b *Broker) {
 			session.Admin = true
 		}
 
+	} else {
+		log.Printf("Auth failed for %s, Wanted %s, got %s.\n", nick, expected, auth)
 	}
 
 	msg := EventMessage{
