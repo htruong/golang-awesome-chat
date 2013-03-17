@@ -73,8 +73,10 @@ type Broker struct {
 	voting *bool
 	dryrun *bool
 
+	banQueue chan string
+
 	// Cached messages
-	cachedmessages []string
+	cachedmessages []EventMessage
 }
 
 func findInSlice(slice []string, value string) int {
@@ -92,16 +94,52 @@ func findInSlice(slice []string, value string) int {
 //
 func (b *Broker) Start() {
 	go func() {
+		for {
+			booter := <-b.banQueue
+			log.Printf("Got ban request for %s\n", booter)
+			kicked := false
+			for _, session := range b.clients {
+				if session.Nick == booter {
+					session.Muted = true
+				}
+			}
+			log.Printf("Requested all sessions of %s to quit\n", booter)
+
+			if kicked {
+				b.messages <- EventMessage{
+					Service:   true,
+					Timestamp: time.Now().Unix(),
+					Code:      "msg",
+					Origin:    "sys",
+					dest:      "",
+					Payload:   fmt.Sprintf("%s is now muted!", booter)}
+			}
+			log.Printf("Announced %s is gone\n", booter)
+
+			// Clean up
+			for k, val := range b.cachedmessages {
+				if val.Origin == booter {
+					copy(
+						b.cachedmessages[k:],
+						b.cachedmessages[k+1:])
+					b.cachedmessages = b.cachedmessages[:len(b.cachedmessages)-1]
+				}
+			}
+		}
+	}()
+
+	go func() {
 
 		// Loop endlessly
 		//
 		for {
-			//log.Printf("Waiting for the next global message...\n")
+			log.Printf("Waiting for the next global message...\n")
 			//case msg := <-b.messages:
 			msg := <-b.messages
 			msgToSend, err := json.Marshal((msg))
 
-			//log.Printf("Got: %s. Delivering...\n", msgToSend)
+			log.Printf("Got: %s. Delivering...\n", msgToSend)
+			fmt.Printf("%s\n", msgToSend)
 			// There is a new message to send.  For each
 			// attached client, push the new message
 			// into the client's message channel.
@@ -112,15 +150,18 @@ func (b *Broker) Start() {
 					if len(b.cachedmessages) > 99 {
 						b.cachedmessages = b.cachedmessages[1 : len(b.cachedmessages)-1]
 					}
-					b.cachedmessages = append(b.cachedmessages, sMsgToSend)
+					b.cachedmessages = append(b.cachedmessages, msg)
 				}
 
 				for s, session := range b.clients {
 					if (len(msg.dest) == 0) || (session.id == msg.dest) {
+						//log.Printf("Delivering to %s %s", session.id, session.Nick)
 						s <- sMsgToSend
 					}
 				}
-				//log.Printf("Broadcast message to %d clients", len(b.clients))
+				log.Printf("Broadcast message to %d clients", len(b.clients))
+			} else {
+
 			}
 			//}
 		}
@@ -148,12 +189,14 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Add this client to the map of those that should
 	// receive updates
 	newUUID, _ := uuid.GenUUID()
+
 	b.clients[messageChan] = &Session{
 		id:     newUUID,
 		Muted:  true,
 		Admin:  false,
 		Nick:   "",
-		Joined: time.Now().Unix()}
+		Joined: time.Now().Unix(),
+	}
 	//log.Printf("Added new client %s", newUUID)
 
 	// Send UUID back to client
@@ -169,7 +212,8 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Sent new client its uuid %s", newUUID)
 		//log.Printf(">>>> %d", len(b.cachedmessages))
 		for _, val := range b.cachedmessages {
-			messageChan <- val
+			msg, _ := json.Marshal(val)
+			messageChan <- string(msg)
 		}
 	}()
 
@@ -203,7 +247,7 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// there is a new message to send along.
 	done := false
 	for !done {
-		//log.Printf("Waiting for the next channel message...\n")
+		//log.Printf("Waiting for the next channel message for %s...\n", newUUID)
 		msg := <-messageChan
 		//log.Printf("Got: %s. Sending...\n", msg)
 		_, err := fmt.Fprintf(w, "data: %s\n\n", msg)
@@ -212,6 +256,7 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		} else {
 			f.Flush()
 		}
+
 	}
 }
 
@@ -220,6 +265,25 @@ func AuthHandler(w http.ResponseWriter, r *http.Request, b *Broker) {
 	nick := v.Get("nick")
 	auth := v.Get("auth")
 	uuid := v.Get("uuid")
+
+	success := false
+
+	defer func() {
+		msg := EventMessage{
+			Service:   false,
+			Timestamp: time.Now().Unix(),
+			Code:      "auth-result",
+			Origin:    "sys",
+			dest:      uuid,
+			Payload:   fmt.Sprintf("%t", success)}
+
+		msgToSend, _ := json.Marshal((msg))
+
+		w.Header().Set("Content-Type", "text/javascript")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Write(msgToSend)
+	}()
+
 	secret, err := b.cfg.GetString("server", "secret")
 	if err != nil {
 		secret = ""
@@ -228,11 +292,26 @@ func AuthHandler(w http.ResponseWriter, r *http.Request, b *Broker) {
 	h := md5.New()
 	io.WriteString(h, nick)
 	io.WriteString(h, secret)
-	success := 0
+
 	t := h.Sum(nil)
 	expected := fmt.Sprintf("%x", t)
 	if auth == expected || *b.dryrun {
-		success = 1
+		isBanned := (*b.bannedUsers)[nick]
+		isAdmin := (*b.adminUsers)[nick]
+
+		session := findSession(b, uuid)
+
+		if isAdmin {
+			session.Admin = true
+		}
+
+		if !isBanned {
+			session.Muted = false
+		} else if !isAdmin {
+			return
+		}
+
+		success = true
 
 		// announce join
 		b.messages <- EventMessage{
@@ -243,37 +322,11 @@ func AuthHandler(w http.ResponseWriter, r *http.Request, b *Broker) {
 			dest:      "",
 			Payload:   nick}
 
-		session := findSession(b, uuid)
 		session.Nick = nick
-
-		isBanned := (*b.bannedUsers)[nick]
-		isAdmin := (*b.adminUsers)[nick]
-
-		if !isBanned {
-			session.Muted = false
-		}
-
-		if isAdmin {
-			session.Admin = true
-		}
 
 	} else {
 		log.Printf("Auth failed for %s, Wanted %s, got %s.\n", nick, expected, auth)
 	}
-
-	msg := EventMessage{
-		Service:   false,
-		Timestamp: time.Now().Unix(),
-		Code:      "msg-receipt",
-		Origin:    "sys",
-		dest:      uuid,
-		Payload:   string(success)}
-
-	msgToSend, _ := json.Marshal((msg))
-
-	w.Header().Set("Content-Type", "text/javascript")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Write(msgToSend)
 	//fmt.Fprintf(w, "%s", msgToSend)
 }
 
@@ -375,16 +428,9 @@ func CommandHandler(w http.ResponseWriter, r *http.Request, b *Broker) {
 	switch cmd[0] {
 	case "ban":
 		(*b.bannedUsers)[cmd[1]] = true
-		sess := findSessionByNickname(b, cmd[1])
-		if sess != nil {
-			sess.Muted = true
-		}
+		b.banQueue <- cmd[1]
 	case "unban":
 		delete(*b.bannedUsers, cmd[1])
-		sess := findSessionByNickname(b, cmd[1])
-		if sess != nil {
-			sess.Muted = false
-		}
 	case "op":
 		(*b.adminUsers)[cmd[1]] = true
 		sess := findSessionByNickname(b, cmd[1])
@@ -439,10 +485,7 @@ func CommandHandler(w http.ResponseWriter, r *http.Request, b *Broker) {
 					Payload:   fmt.Sprintf("Vote passed! Banning %s...", cmd[1])}
 
 				(*b.bannedUsers)[cmd[1]] = true
-				sess := findSessionByNickname(b, cmd[1])
-				if sess != nil {
-					sess.Muted = true
-				}
+				b.banQueue <- cmd[1]
 			} else {
 				b.messages <- EventMessage{
 					Service:   true,
@@ -494,9 +537,12 @@ func CommandHandler(w http.ResponseWriter, r *http.Request, b *Broker) {
 
 func findLegitSessions(all map[chan string]*Session) []Session {
 	sessions := make([]Session, 0, 100)
+	seenNicks := make([]string, 0, 100)
 	for _, session := range all {
 		if len(session.Nick) > 0 {
-			sessions = append(sessions, *session)
+			if findInSlice(seenNicks, session.Nick) < 0 {
+				sessions = append(sessions, *session)
+			}
 		}
 	}
 	return sessions
@@ -546,7 +592,7 @@ func main() {
 	voted := make([]string, 100)
 	voting := false
 
-	cachedmessages := make([]string, 0, 100)
+	cachedmessages := make([]EventMessage, 0, 100)
 
 	// Make a new Broker instance
 	b := &Broker{
@@ -560,6 +606,7 @@ func main() {
 		votes:          make(chan bool),
 		voted:          &voted,
 		voting:         &voting,
+		banQueue:       make(chan string),
 	}
 
 	// Start processing events
