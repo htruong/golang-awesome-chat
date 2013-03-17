@@ -382,6 +382,9 @@ function addMessage (from, text, time, cssclass) {
 	
 	if (lastSender == from) {
 		lastMsgDiv.html(lastMsgDiv.html() + ' &bull; <span class="msg-text">' + text  + '</span>')
+		var nick_re = new RegExp(authNick);
+		if (nick_re.exec(text))
+			lastMsgDiv.addClass("personal");
 		scrollDown();
 		return;
 	}
