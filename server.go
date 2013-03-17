@@ -542,6 +542,7 @@ func findLegitSessions(all map[chan string]*Session) []Session {
 		if len(session.Nick) > 0 {
 			if findInSlice(seenNicks, session.Nick) < 0 {
 				sessions = append(sessions, *session)
+				seenNicks = append(seenNicks, session.Nick)
 			}
 		}
 	}
