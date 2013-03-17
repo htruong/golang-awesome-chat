@@ -475,12 +475,6 @@ func CommandHandler(w http.ResponseWriter, r *http.Request, b *Broker) {
 		return
 	}
 
-	if strings.HasPrefix(cmd[0], "_") &&
-		(len(findLegitSessions(b.clients)) < 5 && !*b.dryrun) {
-		log.Printf("%s wants to call vote, but not enough people are in... Nope!\n", session.Nick)
-		return
-	}
-
 	ret = "true"
 	log.Printf("%s: Executing '%s'!\n", session.Nick, payload)
 	switch cmd[0] {
@@ -536,6 +530,12 @@ func CommandHandler(w http.ResponseWriter, r *http.Request, b *Broker) {
 			ret = "Another voting session is in progress"
 			return
 		}
+
+		if len(findLegitSessions(b.clients)) < 5 && !*b.dryrun {
+			log.Printf("%s wants to call vote, but not enough people are in... Nope!\n", session.Nick)
+			return
+		}
+
 		go func() {
 			target := cmd[1]
 			if cmd[1][0] == '#' {
