@@ -8,6 +8,7 @@ var CONFIG = { debug: false
 
 var uuid = "";
 var authNick = "";
+var authHash = "";
 
 ///////////////////////////////////////////////////////////////////////
 
@@ -447,7 +448,7 @@ function processEvent(evt) {
 				, type: "GET"
 				, url: "/chat/auth/"
 				, dataType: "json"
-				, data: { nick: authNick, uuid: uuid }
+				, data: { nick: authNick, uuid: uuid, auth: authHash }
 			});
 			break;
 			
@@ -556,22 +557,6 @@ function send(msg) {
 	}
 }
 
-//Transition the page to the state that prompts the user for a nickname
-function showConnect () {
-	$("#connect").show();
-	$("#loading").hide();
-	$("#toolbar").hide();
-	$("#nickInput").focus();
-	if (getQueryVariable("nick")) {
-		$("#nickInput").val(getQueryVariable("nick"));
-	}
-	
-	if (getQueryVariable("authstring")) {
-		$("#authstring").val(getQueryVariable("authstring"));
-	}
-}
-
-
 function getQueryVariable(variable) {
 	var query = window.location.hash;
 	var vars = query.split("&");
@@ -677,7 +662,7 @@ $(document).ready(function() {
 	$("#usersLink").click(outputUsers);
 	
 	authNick = getQueryVariable("nick") || "Anonymous";
-	authHash = getQueryVariable("auth") || "";
+	authHash = getQueryVariable("auth") || "-";
 	
 	window.location.hash=""; 
 	

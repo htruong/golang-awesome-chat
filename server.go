@@ -229,18 +229,19 @@ func AuthHandler(w http.ResponseWriter, r *http.Request, b *Broker) {
 			Origin:    "sys",
 			dest:      "",
 			Payload:   nick}
-	}
 
-	session := findSession(b, uuid)
-	session.Nick = nick
-	isBanned := (*b.bannedUsers)[nick]
-	isAdmin := (*b.adminUsers)[nick]
-	if !isBanned {
-		session.Muted = false
-	}
+		session := findSession(b, uuid)
+		session.Nick = nick
+		isBanned := (*b.bannedUsers)[nick]
+		isAdmin := (*b.adminUsers)[nick]
+		if !isBanned {
+			session.Muted = false
+		}
 
-	if isAdmin || dryrun {
-		session.Admin = true
+		if isAdmin || dryrun {
+			session.Admin = true
+		}
+
 	}
 
 	msg := EventMessage{
@@ -392,6 +393,7 @@ func UsersListHandler(w http.ResponseWriter, r *http.Request, b *Broker) {
 func main() {
 	var configFile *string = flag.String("f", "lily.conf", "Config file")
 	var port *string = flag.String("p", "8080", "Server Port")
+	var wwwroot *string = flag.String("r", "/usr/local/share/chatserver", "Chatserver static root")
 	var verbose *bool = flag.Bool("v", false, "Verbose")
 
 	flag.Parse()
@@ -458,7 +460,7 @@ func main() {
 
 	// When we get a request at "/", call `MainPageHandler`
 	// in a new goroutine.
-	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
+	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir(*wwwroot))))
 
 	// Start the server and listen forever on port 8000.
 	http.ListenAndServe(":"+*port, nil)
