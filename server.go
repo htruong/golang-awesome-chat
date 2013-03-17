@@ -68,8 +68,22 @@ type Broker struct {
 	// to attahed clients.
 	messages chan EventMessage
 
+	votes  chan bool
+	voted  *[]string
+	voting *bool
+	dryrun *bool
+
 	// Cached messages
 	cachedmessages []string
+}
+
+func findInSlice(slice []string, value string) int {
+	for p, v := range slice {
+		if v == value {
+			return p
+		}
+	}
+	return -1
 }
 
 // This Broker method starts a new goroutine.  It handles
@@ -82,12 +96,12 @@ func (b *Broker) Start() {
 		// Loop endlessly
 		//
 		for {
-			log.Printf("Waiting for the next global message...\n")
+			//log.Printf("Waiting for the next global message...\n")
 			//case msg := <-b.messages:
 			msg := <-b.messages
 			msgToSend, err := json.Marshal((msg))
 
-			log.Printf("Got: %s. Delivering...\n", msgToSend)
+			//log.Printf("Got: %s. Delivering...\n", msgToSend)
 			// There is a new message to send.  For each
 			// attached client, push the new message
 			// into the client's message channel.
@@ -140,7 +154,7 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Admin:  false,
 		Nick:   "",
 		Joined: time.Now().Unix()}
-	log.Printf("Added new client %s", newUUID)
+	//log.Printf("Added new client %s", newUUID)
 
 	// Send UUID back to client
 	go func() {
@@ -153,7 +167,7 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Payload:   newUUID})
 		messageChan <- string(msg)
 		log.Printf("Sent new client its uuid %s", newUUID)
-		log.Printf(">>>> %d", len(b.cachedmessages))
+		//log.Printf(">>>> %d", len(b.cachedmessages))
 		for _, val := range b.cachedmessages {
 			messageChan <- val
 		}
@@ -189,9 +203,9 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// there is a new message to send along.
 	done := false
 	for !done {
-		log.Printf("Waiting for the next channel message...\n")
+		//log.Printf("Waiting for the next channel message...\n")
 		msg := <-messageChan
-		log.Printf("Got: %s. Sending...\n", msg)
+		//log.Printf("Got: %s. Sending...\n", msg)
 		_, err := fmt.Fprintf(w, "data: %s\n\n", msg)
 		if err != nil {
 			done = true
@@ -210,17 +224,14 @@ func AuthHandler(w http.ResponseWriter, r *http.Request, b *Broker) {
 	if err != nil {
 		secret = ""
 	}
-	dryrun, err := b.cfg.GetBool("server", "dryrun")
-	if err != nil {
-		dryrun = false
-	}
+
 	h := md5.New()
 	io.WriteString(h, nick)
 	io.WriteString(h, secret)
 	success := 0
 	t := h.Sum(nil)
 	expected := fmt.Sprintf("%x", t)
-	if auth == expected || dryrun {
+	if auth == expected || *b.dryrun {
 		success = 1
 
 		// announce join
@@ -234,13 +245,15 @@ func AuthHandler(w http.ResponseWriter, r *http.Request, b *Broker) {
 
 		session := findSession(b, uuid)
 		session.Nick = nick
+
 		isBanned := (*b.bannedUsers)[nick]
 		isAdmin := (*b.adminUsers)[nick]
+
 		if !isBanned {
 			session.Muted = false
 		}
 
-		if isAdmin || dryrun {
+		if isAdmin {
 			session.Admin = true
 		}
 
@@ -324,37 +337,8 @@ func CommandHandler(w http.ResponseWriter, r *http.Request, b *Broker) {
 
 	ret := "false"
 
-	session := findSession(b, uuid)
-
-	if !session.Admin {
-		return
-	}
-
-	// Okay let's do it
-	cmd := strings.SplitN(payload, " ", 2)
-	ret = "true"
-	switch cmd[0] {
-	case "ban":
-		(*b.bannedUsers)[cmd[1]] = true
-		sess := findSessionByNickname(b, cmd[1])
-		sess.Muted = true
-	case "unban":
-		delete(*b.bannedUsers, cmd[1])
-		sess := findSessionByNickname(b, cmd[1])
-		sess.Muted = false
-	case "op":
-		(*b.adminUsers)[cmd[1]] = true
-		sess := findSessionByNickname(b, cmd[1])
-		sess.Admin = true
-	case "unop":
-		delete(*b.adminUsers, cmd[1])
-		sess := findSessionByNickname(b, cmd[1])
-		sess.Admin = false
-	default:
-		ret = "false"
-	}
-
 	defer func() {
+		log.Printf("%s '%s' returns %s\n", uuid, payload, ret)
 		msg := EventMessage{
 			Service:   true,
 			Timestamp: time.Now().Unix(),
@@ -370,19 +354,157 @@ func CommandHandler(w http.ResponseWriter, r *http.Request, b *Broker) {
 		w.Write(msgToSend)
 	}()
 
+	session := findSession(b, uuid)
+
+	// Okay let's do it
+	cmd := strings.SplitN(payload, " ", 2)
+
+	if !session.Admin && !strings.HasPrefix(cmd[0], "_") {
+		log.Printf("%s wanted to do an administrative command... Nope!\n", session.Nick)
+		return
+	}
+
+	if strings.HasPrefix(cmd[0], "_") &&
+		(len(findLegitSessions(b.clients)) < 5 && !*b.dryrun) {
+		log.Printf("%s wants to call vote, but not enough people are in... Nope!\n", session.Nick)
+		return
+	}
+
+	ret = "true"
+	log.Printf("%s: Executing '%s'!\n", session.Nick, payload)
+	switch cmd[0] {
+	case "ban":
+		(*b.bannedUsers)[cmd[1]] = true
+		sess := findSessionByNickname(b, cmd[1])
+		if sess != nil {
+			sess.Muted = true
+		}
+	case "unban":
+		delete(*b.bannedUsers, cmd[1])
+		sess := findSessionByNickname(b, cmd[1])
+		if sess != nil {
+			sess.Muted = false
+		}
+	case "op":
+		(*b.adminUsers)[cmd[1]] = true
+		sess := findSessionByNickname(b, cmd[1])
+		if sess != nil {
+			sess.Admin = true
+		}
+	case "unop":
+		delete(*b.adminUsers, cmd[1])
+		sess := findSessionByNickname(b, cmd[1])
+		if sess != nil {
+			sess.Admin = false
+		}
+	case "_ban":
+		if *b.voting {
+			ret = "false"
+			return
+		}
+		go func() {
+			votes := 1
+			votes_pass := len(findLegitSessions(b.clients)) / 4 * 3
+			b.messages <- EventMessage{
+				Service:   true,
+				Timestamp: time.Now().Unix(),
+				Code:      "msg",
+				Origin:    "sys",
+				dest:      "",
+				Payload: fmt.Sprintf("%s wants to vote to boycott %s. Reply with /_yes or /_no in the next 30 seconds to vote. Pass if at least %d people say yes.",
+					session.Nick, cmd[1], votes_pass)}
+			(*b.voting) = true
+			(*b.voted) = make([]string, 100)
+			*b.voted = append(*b.voted, session.Nick)
+			done := false
+			for !done {
+				select {
+				case <-b.votes:
+					votes++
+					if votes >= votes_pass {
+						done = true
+					}
+				case <-time.After(30 * time.Second):
+					done = true
+				}
+			}
+
+			if votes >= votes_pass {
+				b.messages <- EventMessage{
+					Service:   true,
+					Timestamp: time.Now().Unix(),
+					Code:      "msg",
+					Origin:    "sys",
+					dest:      "",
+					Payload:   fmt.Sprintf("Vote passed! Banning %s...", cmd[1])}
+
+				(*b.bannedUsers)[cmd[1]] = true
+				sess := findSessionByNickname(b, cmd[1])
+				if sess != nil {
+					sess.Muted = true
+				}
+			} else {
+				b.messages <- EventMessage{
+					Service:   true,
+					Timestamp: time.Now().Unix(),
+					Code:      "msg",
+					Origin:    "sys",
+					dest:      "",
+					Payload:   fmt.Sprintf("Not enough people voted yes. %s stays here", cmd[1])}
+			}
+			(*b.voting) = false
+
+		}()
+	case "_yes", "_no":
+		ans := false
+
+		if cmd[0] == "_yes" {
+			ans = true
+		}
+
+		if !*b.voting {
+			ret = "false"
+			return
+		}
+
+		if findInSlice(*b.voted, session.Nick) > -1 {
+			ret = "false"
+			return
+		} else {
+			*b.voted = append(*b.voted, session.Nick)
+		}
+
+		b.messages <- EventMessage{
+			Service:   true,
+			Timestamp: time.Now().Unix(),
+			Code:      "msg",
+			Origin:    "sys",
+			dest:      "",
+			Payload:   fmt.Sprintf("One person said %t.", ans)}
+
+		if ans == true {
+			b.votes <- true
+		}
+
+	default:
+		ret = "false"
+	}
+
 }
 
-func UsersListHandler(w http.ResponseWriter, r *http.Request, b *Broker) {
-
+func findLegitSessions(all map[chan string]*Session) []Session {
 	sessions := make([]Session, 0, 100)
-	for _, session := range b.clients {
+	for _, session := range all {
 		if len(session.Nick) > 0 {
 			sessions = append(sessions, *session)
 		}
 	}
+	return sessions
+}
 
+func UsersListHandler(w http.ResponseWriter, r *http.Request, b *Broker) {
 	msg := UserListMessage{
-		Sessions: sessions,
+		Sessions: findLegitSessions(b.clients),
 	}
 
 	w.Header().Set("Content-Type", "text/javascript")
@@ -415,7 +537,14 @@ func main() {
 		adminUsers[i] = true
 	}
 
+	dryrun, err := cfg.GetBool("server", "dryrun")
+	if err != nil {
+		dryrun = false
+	}
+
 	bannedUsers := make(map[string]bool)
+	voted := make([]string, 100)
+	voting := false
 
 	cachedmessages := make([]string, 0, 100)
 
@@ -427,6 +556,10 @@ func main() {
 		adminUsers:     &adminUsers,
 		messages:       make(chan EventMessage),
 		cachedmessages: cachedmessages,
+		dryrun:         &dryrun,
+		votes:          make(chan bool),
+		voted:          &voted,
+		voting:         &voting,
 	}
 
 	// Start processing events

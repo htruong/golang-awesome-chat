@@ -406,7 +406,7 @@ function addMessage (from, text, time, _class) {
 	
 	// If the current user said this, add a special css class
 	var nick_re = new RegExp(CONFIG.nick);
-	if (nick_re.exec(text) || from == "sys:bot")
+	if (nick_re.exec(text) || from == "sys")
 		messageElement.addClass("personal");
 	
 	// replace URLs with links
@@ -551,7 +551,11 @@ function send(msg) {
 			payload = msg.substr(1);
 			jQuery.get("/chat/command/", {uuid: uuid, payload: payload}, function (data) {
 					console.log(data);
-					processEvent (data);
+					if (data.Payload == "true") {
+						addMessage(data.Origin, "Your command is completed successfully", data.Timestamp);
+					} else {
+						addMessage(data.Origin, "Bad command or file name", data.Timestamp);
+					}
 			}, "json");
 		}
 	}
